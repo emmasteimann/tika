@@ -42,6 +42,8 @@ import java.io.*;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.net.URL;
+import java.net.URLConnection;
 
 @Path("/tika{id:(/.*)?}")
 public class TikaResource {
@@ -78,7 +80,26 @@ public class TikaResource {
 
     return parser;
   }
+  public static void fillMetadata(AutoDetectParser parser, Metadata metadata, String contentType) {
 
+    if (contentType !=null) {
+      metadata.add(org.apache.tika.metadata.HttpHeaders.CONTENT_TYPE, contentType);
+
+      final Detector detector = parser.getDetector();
+
+      parser.setDetector(new Detector() {
+        public MediaType detect(InputStream inputStream, Metadata metadata) throws IOException {
+          String ct = metadata.get(org.apache.tika.metadata.HttpHeaders.CONTENT_TYPE);
+
+          if (ct!=null) {
+            return MediaType.parse(ct);
+          } else {
+            return detector.detect(inputStream, metadata);
+          }
+        }
+      });
+    }
+  }
   public static void fillMetadata(AutoDetectParser parser, Metadata metadata, HttpHeaders httpHeaders) {
     List<String> fileName = httpHeaders.getRequestHeader("File-Name");
     if (fileName!=null && !fileName.isEmpty()) {
@@ -112,7 +133,65 @@ public class TikaResource {
       });
     }
   }
+  @POST
+  @Consumes("*/*")
+  @Produces("text/plain")
+  public StreamingOutput returnBasedOnURI(@FormParam("url") String url, @FormParam("content_type") String contentType, @Context HttpHeaders httpHeaders, @Context final UriInfo info) throws IOException{
+    final URL assetURL = new URL(url);
 
+    final AutoDetectParser parser = createParser();
+    final Metadata metadata = new Metadata();
+
+    fillMetadata(parser, metadata, contentType);
+
+    logRequest(logger, info, metadata);
+
+    return new StreamingOutput() {
+      public void write(OutputStream outputStream) throws IOException, WebApplicationException {
+        Writer writer = new OutputStreamWriter(outputStream, "UTF-8");
+
+        BodyContentHandler body = new BodyContentHandler(new RichTextContentHandler(writer));
+
+        TikaInputStream tis = TikaInputStream.get(assetURL);
+
+        try {
+          tis.getFile();
+
+          parser.parse(tis, body, metadata);
+        } catch (SAXException e) {
+          throw new WebApplicationException(e);
+        } catch (EncryptedDocumentException e) {
+          logger.warn(String.format(
+                  "%s: Encrypted document",
+                  info.getPath()
+          ), e);
+
+          throw new WebApplicationException(e, Response.status(422).build());
+        } catch (TikaException e) {
+          logger.warn(String.format(
+            "%s: Text extraction failed",
+            info.getPath()
+          ), e);
+
+          if (e.getCause()!=null && e.getCause() instanceof WebApplicationException) {
+            throw (WebApplicationException) e.getCause();
+          }
+
+          if (e.getCause()!=null && e.getCause() instanceof IllegalStateException) {
+            throw new WebApplicationException(Response.status(422).build());
+          }
+
+          if (e.getCause()!=null && e.getCause() instanceof OldWordFileFormatException) {
+            throw new WebApplicationException(Response.status(422).build());
+          }
+
+          throw new WebApplicationException(Response.Status.INTERNAL_SERVER_ERROR);
+        } finally {
+          tis.close();
+        }
+      };
+    };
+  }
   @PUT
   @Consumes("*/*")
   @Produces("text/plain")
